@@ -1,0 +1,735 @@
+1.  
+参考 README_windows.txt 里面的说明，给你你的exe程序，添加上tcmalloc的
+链接符号。强制把tcmalloc 加进去。tcmalloc 初始化时候，就会自动hook c
+运行时库里面malloc 等函数，把内存分配函数替换为tcmalloc的函数。
+
+然后把libtcmalloc_minimal.dll 放到你的exe可执行文件可以找到的路径，然后启动
+程序就可以了。
+
+2.
+根据文档需要启动 heap profiler，设置这个环境变量就可以了。
+set HEAPPROFILE=heap_profile
+
+就是指定一个要把统计信息dump到那个文件的前缀，可以使用绝对路径或者相对路径。
+
+3.
+但很快发现就算设置了这个环境变量，文件也是没有保存的。
+README_windows.txt 里面说了在windows 平台是支持heap profiler的
+但最新代码的默认vc工程libtcmalloc_minimal里面却没有包含heap profiler模块
+代码的（可能是由于后面说的死锁问题）。需要手工把把 heap-profiler.cc 
+添加到libtcmalloc_minimal 项目。
+
+vc 2008有一个编译错误，需要修复一下。
+因为heap-profiler.cc 里面也使用了
+  //static const int kMaxStackDepth = 32;
+这个静态类常量成员，vc 2008 里面有bug，编译的时候会出现符号重定义。
+所以我把它改成  enum {kMaxStackDepth = 32}; 让它通过编译。
+------------------------------
+class HeapProfileTable {
+ public:
+
+  // Extension to be used for heap pforile files.
+  static const char kFileExt[];
+
+  // Longest stack trace we record.
+  //static const int kMaxStackDepth = 32;
+  enum {kMaxStackDepth = 32};
+------------------------------
+
+4.  
+现在的heap profile的代码在Windows 下面还也有死锁问题。至少我在windows 7下面碰到了。 
+Some issues of HeapProfile in windows
+https://code.google.com/p/gperftools/issues/detail?id=267
+
+参考上面这篇文档，有可能是CreateFile 等API函数里面做文件名转换之类功能时，又
+调用了malloc等内存分配函数。 因为dump heap profiler的时候已经持有heap_lock了，
+malloc导致嵌套调用重复spinlock死锁。
+修复的办法就是修改logging。cc文件，让那些打开关闭文件的函数不再分配内存。
+上面的帖子写了一个更底层api的patch。但google的开发人员好像还没把这个合并到官方
+代码。 可能觉得那样修改不是很好吧，大家也不重视Windows平台。我在一个2个线程的
+程序里面测试发现tcmalloc的性能是比windows系统自带的c 运行时库的性能要差一点的。
+
+我也觉得原帖子的修改太麻烦。 就写了一个简单的基于共享内存方式的。 把写文件操作
+放到另外一个进程去做，这样应该可以保证写文件的时候没有内存分配发生，就不会死锁了。
+直接用Windows api还是没法保证不会有内存分配啊，没有源码你谁知道Windows的底层
+怎么实现的。
+
+测试发现，heap profiler的dump数据量不算太大，也不是很频繁，应该是可以满足要求的。
+下面是我做的修改：
+
+diff -rwup gperftools-2.1-origin/src/base/logging.cc gperftools-2.1/src/base/logging.cc
+--- gperftools-2.1-origin/src/base/logging.cc	Mon Jul 29 11:20:40 2013
++++ gperftools-2.1/src/base/logging.cc	Sun Jan 26 20:03:15 2014
+@@ -39,7 +39,214 @@ DEFINE_int32(verbose, EnvToInt("PERFTOOL
+              "--verbose == -4 means we log fatal errors only.");
+ 
+ 
+-#if defined(_WIN32) || defined(__CYGWIN__) || defined(__CYGWIN32__)
++#if defined(_WIN32) 
++
++#include "base/spinlock.h"
++
++enum {
++	kSharedMemorySize = 1024 * 1024 * 2  // 2 MB
++};
++
++enum OperationType {
++	kCreateFile = 1,
++	kWriteFile  = 2,
++	kCloseFile  = 3
++};
++
++struct Operation {
++	OperationType type;	
++	HANDLE file_handle;
++	size_t data_legnth;
++	char filebame_or_data[256];
++};
++
++static SpinLock logging_file_lock(SpinLock::LINKER_INITIALIZED);
++static Operation * file_operation = NULL;
++static RawFD tcmalloc_shared_memory = NULL;
++static RawFD tcmalloc_shared_memory_mutex = NULL;
++static RawFD tcmalloc_file_op_event = NULL;
++static RawFD tcmalloc_file_op_finished_event = NULL;
++
++void logging_init()
++{
++	SpinLockHolder l(&logging_file_lock);
++	// 1. mutex
++	tcmalloc_shared_memory_mutex = OpenMutex(
++		SYNCHRONIZE | MUTEX_ALL_ACCESS,
++		true,
++		"tcmalloc_shared_memory_mutex"
++		);
++	if (tcmalloc_shared_memory_mutex == NULL) {
++		RAW_LOG(ERROR, "failed to OpenMutex tcmalloc_shared_memory_mutex!\n");
++		return;
++	}
++
++	// 2. start event
++	tcmalloc_file_op_event = OpenEvent(
++		SYNCHRONIZE | EVENT_ALL_ACCESS,
++		true,
++		"tcmalloc_file_op_event"
++		);
++	if (tcmalloc_file_op_event == NULL) {
++		RAW_LOG(ERROR, "failed to OpenEvent tcmalloc_file_op_event!\n");
++		return;
++	}
++
++	// 3. end event
++	tcmalloc_file_op_finished_event = OpenEvent(
++		SYNCHRONIZE | EVENT_ALL_ACCESS,
++		true,
++		"tcmalloc_file_op_finished_event"
++		);
++	if (tcmalloc_file_op_finished_event == NULL) {
++		RAW_LOG(ERROR, "failed to OpenEvent tcmalloc_file_op_finished_event!\n");
++		return;
++	}
++
++	// 4. share memory
++	tcmalloc_shared_memory = OpenFileMapping(
++		FILE_MAP_ALL_ACCESS,
++		true,
++		"tcmalloc_shared_memory");
++	if (tcmalloc_shared_memory == NULL) {
++		RAW_LOG(ERROR, "failed to OpenViewOfFile tcmalloc_shared_memory!\n");
++		return;
++	}
++
++	file_operation = (Operation *) MapViewOfFile(
++		tcmalloc_shared_memory,
++		FILE_MAP_ALL_ACCESS,
++		0,
++		0,
++		kSharedMemorySize
++		);
++	if (file_operation == NULL) {
++		RAW_LOG(ERROR, "failed to MapViewOfFile file_operation!\n");
++		return;
++	}
++
++	RAW_VLOG(0, "logging_init()");	
++}
++
++void logging_exit()
++{
++	SpinLockHolder l(&logging_file_lock);
++	if (file_operation == NULL) {
++		return;
++	}
++
++	if (!UnmapViewOfFile(file_operation)) {
++		RAW_LOG(ERROR,"failed to UnmapViewOfFile tcmalloc_shared_memory_address!\n");
++		return;
++	}
++	file_operation = NULL;
++
++	if (!CloseHandle(tcmalloc_file_op_event)) {
++		RAW_LOG(ERROR, "failed to CloseHandle tcmalloc_file_op_event!\n");
++		return;
++	}
++	tcmalloc_file_op_event = NULL;
++
++	if (!CloseHandle(tcmalloc_file_op_finished_event)) {
++		RAW_LOG(ERROR, "failed to CloseHandle tcmalloc_file_op_finished_event!\n");
++		return;
++	}
++	tcmalloc_file_op_finished_event = NULL;
++
++	if (!CloseHandle(tcmalloc_shared_memory_mutex)) {
++		RAW_LOG(ERROR,"failed to CloseHandle tcmalloc_shared_memory_mutex!\n");
++		return;
++	}
++	tcmalloc_shared_memory_mutex = NULL;
++
++	RAW_VLOG(0, "logging_exit()");	
++}
++
++
++RawFD RawOpenForWriting(const char* filename) 
++{
++	SpinLockHolder l(&logging_file_lock);
++	if (file_operation == NULL) {
++		return NULL;
++	}
++
++	// acquire the shared memory mutex
++	if (WAIT_OBJECT_0 != WaitForSingleObject(tcmalloc_shared_memory_mutex, INFINITE)) {
++		RAW_LOG(ERROR,"RawOpenForWriting failed to acquire the shared memory mutex\n");
++		return NULL;
++	}
++
++	file_operation->file_handle = NULL;
++	file_operation->type = kCreateFile;
++	memcpy(file_operation->filebame_or_data,filename,strlen(filename)+1);
++	SetEvent(tcmalloc_file_op_event);
++
++	if (WAIT_OBJECT_0 != WaitForSingleObject(tcmalloc_file_op_finished_event, INFINITE)) {
++		RAW_LOG(ERROR,"RawOpenForWriting failed to WaitForSingleObject tcmalloc_file_op_finished_event\n");
++	}
++	RawFD fd = file_operation->file_handle;
++
++    // release the shared memory mutex
++	if (!ReleaseMutex(tcmalloc_shared_memory_mutex)) {
++		RAW_LOG(ERROR,  "RawOpenForWriting fialed to  ReleaseMutextcmalloc_shared_memory_mutex!\n");
++	}
++	return fd;
++}
++
++void RawWrite(RawFD handle, const char* buf, size_t len) {
++	if (len > kSharedMemorySize - sizeof(struct Operation) * 2) {
++		RAW_LOG(ERROR,  "RawWrite buffer size > kSharedMemorySize!\n");
++		return;
++	}
++	SpinLockHolder l(&logging_file_lock);
++	if (file_operation == NULL) {
++		return;
++	}
++	// acquire the shared memory mutex
++	if (WAIT_OBJECT_0 != WaitForSingleObject(tcmalloc_shared_memory_mutex, INFINITE)) {
++		RAW_LOG(ERROR,"RawWrite failed to acquire the shared memory mutex\n");
++		return;
++	}
++	file_operation->file_handle = handle;
++	file_operation->type = kWriteFile;
++	file_operation->data_legnth = len;	
++	memcpy(file_operation->filebame_or_data, buf, len);
++	SetEvent(tcmalloc_file_op_event);
++	if (WAIT_OBJECT_0 != WaitForSingleObject(tcmalloc_file_op_finished_event, INFINITE)) {
++		RAW_LOG(ERROR,"fRawWrite ailed to WaitForSingleObject tcmalloc_file_op_finished_event\n");
++	}
++
++    // release the shared memory mutex
++	if (!ReleaseMutex(tcmalloc_shared_memory_mutex)) {
++		RAW_LOG(ERROR,  "RawWrite fialed to  ReleaseMutextcmalloc_shared_memory_mutex!\n");
++	} 
++}
++
++void RawClose(RawFD handle) {
++	SpinLockHolder l(&logging_file_lock);
++	if (file_operation == NULL) {
++		return;
++	}
++	// acquire the shared memory mutex
++	if (WAIT_OBJECT_0 != WaitForSingleObject(tcmalloc_shared_memory_mutex, INFINITE)) {
++		RAW_LOG(ERROR,"RawClose failed to acquire the shared memory mutex\n");
++		return;
++	}
++	file_operation->file_handle = handle;
++	file_operation->type = kCloseFile;
++	SetEvent(tcmalloc_file_op_event);
++	if (WAIT_OBJECT_0 != WaitForSingleObject(tcmalloc_file_op_finished_event, INFINITE)) {
++		RAW_LOG(ERROR,"RawClose failed to WaitForSingleObject tcmalloc_file_op_finished_event\n");
++	}
++    // release the shared memory mutex
++	if (!ReleaseMutex(tcmalloc_shared_memory_mutex)) {
++		RAW_LOG(ERROR,  "RawClose fialed to  ReleaseMutextcmalloc_shared_memory_mutex!\n");
++	}
++}
++
++
++
++#elif  defined(__CYGWIN__) || defined(__CYGWIN32__)
+ 
+ // While windows does have a POSIX-compatible API
+ // (_open/_write/_close), it acquires memory.  Using this lower-level
+diff -rwup gperftools-2.1-origin/src/heap-profile-table.cc gperftools-2.1/src/heap-profile-table.cc
+--- gperftools-2.1-origin/src/heap-profile-table.cc	Tue Jul 30 17:12:11 2013
++++ gperftools-2.1/src/heap-profile-table.cc	Thu Jan 23 13:58:01 2014
+@@ -101,7 +101,7 @@ const char HeapProfileTable::kFileExt[] 
+ 
+ // Size for alloc_table_ and mmap_table_.
+ static const int kHashTableSize = 179999;
+-/*static*/ const int HeapProfileTable::kMaxStackDepth;
++///*static*/ const int HeapProfileTable::kMaxStackDepth;
+ 
+ //----------------------------------------------------------------------
+ 
+diff -rwup gperftools-2.1-origin/src/heap-profile-table.h gperftools-2.1/src/heap-profile-table.h
+--- gperftools-2.1-origin/src/heap-profile-table.h	Mon Jul 29 11:20:40 2013
++++ gperftools-2.1/src/heap-profile-table.h	Thu Jan 23 13:57:43 2014
+@@ -53,7 +53,9 @@ class HeapProfileTable {
+   static const char kFileExt[];
+ 
+   // Longest stack trace we record.
+-  static const int kMaxStackDepth = 32;
++  //static const int kMaxStackDepth = 32;
++  enum {kMaxStackDepth = 32};
++
+ 
+   // data types ----------------------------
+ 
+diff -rwup gperftools-2.1-origin/src/heap-profiler.cc gperftools-2.1/src/heap-profiler.cc
+--- gperftools-2.1-origin/src/heap-profiler.cc	Tue Jul 30 17:12:11 2013
++++ gperftools-2.1/src/heap-profiler.cc	Sun Jan 26 17:57:02 2014
+@@ -415,6 +415,11 @@ static void SbrkHook(const void* result,
+ // Starting/stopping/dumping
+ //----------------------------------------------------------------------
+ 
++#if defined(_WIN32)
++	void logging_init();
++#endif
++
++
+ extern "C" void HeapProfilerStart(const char* prefix) {
+   SpinLockHolder l(&heap_lock);
+ 
+@@ -422,6 +427,11 @@ extern "C" void HeapProfilerStart(const 
+ 
+   is_on = true;
+ 
++
++#if defined(_WIN32)
++  logging_init();
++#endif
++
+   RAW_VLOG(0, "Starting tracking the heap");
+ 
+   // This should be done before the hooks are set up, since it should
+@@ -478,6 +488,7 @@ extern "C" void HeapProfilerStart(const 
+   filename_prefix = reinterpret_cast<char*>(ProfilerMalloc(prefix_length + 1));
+   memcpy(filename_prefix, prefix, prefix_length);
+   filename_prefix[prefix_length] = '\0';
++
+ }
+ 
+ extern "C" int IsHeapProfilerRunning() {
+@@ -485,8 +496,15 @@ extern "C" int IsHeapProfilerRunning() {
+   return is_on ? 1 : 0;   // return an int, because C code doesn't have bool
+ }
+ 
++#if defined(_WIN32)
++	void logging_exit();
++#endif
+ extern "C" void HeapProfilerStop() {
+   SpinLockHolder l(&heap_lock);
++
++#if defined(_WIN32)
++	logging_exit();
++#endif
+ 
+   if (!is_on) return;
+ 
+
+
+
+
+
+这个是接收端写文件的程序代码
+------------------------------------------------
+#include <iostream>
+
+#include <stdlib.h>
+#include <Windows.h>
+
+using namespace std;
+
+enum {
+	kSharedMemorySize = 1024 * 1024 * 2  // 2 MB
+};
+
+
+enum OperationType {
+	kCreateFile = 1,
+	kWriteFile  = 2,
+	kCloseFile  = 3
+};
+
+struct Operation {
+	OperationType type;	
+	HANDLE file_handle;
+	size_t data_legnth;
+	char filename_or_data[256];
+};
+
+void perform_file_operations(void * shared_memory)
+{
+	Operation *op = (Operation *)shared_memory;
+
+	if (op->type == kWriteFile) {
+		const char* buf = op->filename_or_data;
+		size_t len = op->data_legnth;
+		
+		std::cout << " WriteFile: len=" << len << std::endl;
+
+		while (len > 0) {
+			DWORD wrote;
+			BOOL ok = WriteFile(op->file_handle, buf, len, &wrote, NULL);
+			// We do not use an asynchronous file handle, so ok==false means an error
+			if (!ok) break;
+			buf += wrote;
+			len -= wrote;
+		}
+	} else if (op->type == kCreateFile) {
+		const char * filename = op->filename_or_data;
+		HANDLE fd = CreateFileA(filename, GENERIC_WRITE, 0, NULL,
+			CREATE_ALWAYS, 0, NULL);
+		if (fd != INVALID_HANDLE_VALUE && GetLastError() == ERROR_ALREADY_EXISTS)
+			SetEndOfFile(fd);    // truncate the existing file
+
+		cout << "CreateFileA filename=" << filename << " fd=" << fd << std::endl;
+		op->file_handle = fd;
+	}
+	else if (op->type == kCloseFile) {
+		CloseHandle(op->file_handle);
+		cout << "CloseFile  fd=" << op->file_handle << std::endl;
+	}
+}
+
+void run_tcmalloc_heap_profiler_collector() {
+	// 1. create the shared memory 
+	HANDLE  tcmalloc_shared_memory = CreateFileMapping(
+		INVALID_HANDLE_VALUE,
+		NULL,
+		PAGE_READWRITE | SEC_COMMIT,
+		0,
+		kSharedMemorySize,
+		"tcmalloc_shared_memory"
+		);
+	if (tcmalloc_shared_memory == NULL) {
+		std::cout << "failed to CreateFileMapping tcmalloc_shared_memory!\n";
+		exit(1);
+	}
+
+	LPVOID tcmalloc_shared_memory_address = MapViewOfFile(
+		tcmalloc_shared_memory,
+		FILE_MAP_ALL_ACCESS,
+		0,
+		0,
+		kSharedMemorySize
+		);
+
+	if (tcmalloc_shared_memory_address == NULL) {
+		std::cout << "failed to MapViewOfFile tcmalloc_shared_memory!\n";
+		exit(1);
+	}
+
+	memset(tcmalloc_shared_memory_address, 0, kSharedMemorySize);
+
+
+	// 2. mutex to protect teh shared memory
+	HANDLE  tcmalloc_shared_memory_mutex = CreateMutex(
+		NULL,
+		false,
+		"tcmalloc_shared_memory_mutex"
+		);
+	if (tcmalloc_shared_memory_mutex == NULL) {
+		std::cout << "failed to CreateMutex tcmalloc_shared_memory_mutex!\n";
+		exit(1);
+	}
+
+	// 3. event to signal the collector to read the data from shared memroy
+	HANDLE  tcmalloc_file_op_event = CreateEvent(
+		NULL,
+		false,
+		false,
+		"tcmalloc_file_op_event"
+		);
+	if (tcmalloc_file_op_event == NULL) {
+		std::cout << "failed to CreateEvent tcmalloc_file_op_event!\n";
+		exit(1);
+	}
+
+	// 4.  event to signal the tcmalloc process that the shared memroy data has  been written into disk
+	HANDLE  tcmalloc_file_op_finished_event = CreateEvent(
+		NULL,
+		false,
+		false,
+		"tcmalloc_file_op_finished_event"
+		);
+	if (tcmalloc_file_op_finished_event == NULL) {
+		std::cout << "failed to CreateEvent tcmalloc_file_op_finished_event!\n";
+		exit(1);
+	}
+
+
+	// 5. waiting for request from tcmalloc processs
+	while (true) {
+		if (WAIT_OBJECT_0 == WaitForSingleObject(tcmalloc_file_op_event, INFINITE)) {
+			//6. wirte the data in the shared memroy to file.
+			perform_file_operations(tcmalloc_shared_memory_address);
+
+			// 7. resume the tcmalloc process
+			SetEvent(tcmalloc_file_op_finished_event);
+		}
+		else {
+			std::cout << "failed to WaitForSingleObject tcmalloc_shared_memory_mutex!\n";
+		}
+	}
+
+	// 8. release all resource
+	if (!UnmapViewOfFile(tcmalloc_shared_memory_address)) {
+		std::cout << "failed to UnmapViewOfFile tcmalloc_shared_memory_address!\n";
+	}
+
+	if (!CloseHandle(tcmalloc_file_op_event)) {
+		std::cout << "failed to CloseHandle tcmalloc_file_op_event!\n";
+		exit(1);
+	}
+
+	if (!CloseHandle(tcmalloc_file_op_finished_event)) {
+		std::cout << "failed to CloseHandle tcmalloc_file_op_finished_event!\n";
+		exit(1);
+	}
+
+	if (!CloseHandle(tcmalloc_shared_memory_mutex)) {
+		std::cout << "failed to CloseHandle tcmalloc_shared_memory_mutex!\n";
+		exit(1);
+	}
+
+}
+int main(int, char**)
+{
+	run_tcmalloc_heap_profiler_collector();
+	return 0;
+}
+
+
+----------------------------------------------
+
+
+5.
+重新测试，先启动文件收集程序，再启动测试程序，就可以得到*.heap数据了。 
+
+
+在源码目录下有个perl脚本，用来处理profiler生成的结果
+可以生成各个类型的文件，但好像pdf的在windows下面缺少相应的软件的(Graphviz
+		的dot命令?)
+output type:
+  --text              Generate text report     //简单文本格式
+  --callgrind         Generate callgrind format to stdout  // 
+  --gv                Generate Postscript and display
+  --evince            Generate PDF and display
+  --web               Generate SVG and display
+  --list=<regexp>     Generate source listing of matching routines
+  --disasm=<regexp>   Generate disassembly of matching routines
+  --symbols           Print demangled symbol names found at given addresses
+  --dot               Generate DOT file to stdout
+  --ps                Generate Postcript to stdout
+  --pdf               Generate PDF to stdout
+  --svg               Generate SVG to stdout
+  --gif               Generate GIF to stdout
+  --raw               Generate symbolized pprof data (useful with remote fetch)
+
+eap-Profile Options:
+  --inuse_space       Display in-use (mega)bytes [default] //当前使用的内存的大小
+  --inuse_objects     Display in-use objects    /// object个数的统计
+  --alloc_space       Display allocated (mega)bytes
+  --alloc_objects     Display allocated objects ///相当于调用内存函数的次数吧
+  --show_bytes        Display space in bytes
+  --drop_negative     Ignore negative differences
+
+
+不过这个pprof的perl脚本在windows平台有些小问题，需要改一下的
+
+
+D:\tcmalloc_heap_profiler>perl pprof --text c:\opt\Infitel\tnt\bin\cee.exe heap profile.0025.heap
+D:\tcmalloc_heap_profiler>perl pprof --callgrind c:\opt\Infitel\tnt\bin\cee.exe heap_profile.0025.heap > callgrind.heap_profiler_data
+生成callgrind 格式，然后用kcachegrind.exe打开就很直观了
+
+
+
+6.  
+addr2line-pdb.exe
+nm-pdb.exe
+pprof
+把这个3个程序单独复制出来放到一个目录去，
+编译addr2line-pdb 和 nm-pdb 之前把 WEBSYM这个符号搜索目录默认值修改一下。
+比如我之前的系统dll默认的符号都是下载在C:\\debug_symbols 这个目录的。
+#define WEBSYM "C:\\debug_symbols;SRV*C:\\debug_symbols*http://msdl.microsoft.com/download/symbols"
+
+pprof 脚本要在 Windows的运行，不让在Windows平台解析的调试符号是错误的，
+有一些目录之类的变量也要改成Windows平台的目录名字才行。我做了以下修改。
+-----------------------------------------------------------------
+--- pprof	Tue Jul 30 17:12:11 2013
++++ /d/tcmalloc_heap_profiler/pprof	Mon Jan 27 22:37:10 2014
+@@ -292,8 +292,13 @@ sub Init() {
+   # Setup tmp-file name and handler to clean it up.
+   # We do this in the very beginning so that we can use
+   # error() and cleanup() function anytime here after.
++  if ($^O eq 'MSWin32') {
++	  $main::tmpfile_sym = "d:/tcmalloc_heap_profiler/pprof$$.sym";
++	  $main::tmpfile_ps = "d:/tcmalloc_heap_profiler/pprof$$";
++  } else {
+   $main::tmpfile_sym = "/tmp/pprof$$.sym";
+   $main::tmpfile_ps = "/tmp/pprof$$";
++  }
+   $main::next_tmpfile = 0;
+   $SIG{'INT'} = \&sighandler;
+ 
+@@ -4212,6 +4217,7 @@ sub ParseTextSectionHeaderFromObjdump {
+   # Get objdump output from the library file to figure out how to
+   # map between mapped addresses and addresses in the library.
+   my $cmd = ShellEscape($obj_tool_map{"objdump"}, "-h", $lib);
++
+   open(OBJDUMP, "$cmd |") || error("$cmd: $!\n");
+   while (<OBJDUMP>) {
+     s/\r//g;         # turn windows-looking lines into unix-looking lines
+@@ -4381,6 +4387,26 @@ sub ParseLibraries {
+       }
+     }
+ 
++	# 在windows平台，heap profiler 保存下来的模块加载信息是
++	# Module32Next  API 得到 image base address， 保存的
++	# offset，这个offset总是0. 但上面一段计算在 ParseTextSectionHeader 函数
++	# 用objdump是可以解析出来.text的 vma 和 偏移的。
++	# .text vma = Image Base + RVA
++	# 使用这个地址偏移在windows 平台是不对的，导致最后解析出来的符号地址是错的
++	# 要根据image base来计算偏移才行
++	if ($^O eq 'MSWin32') {
++		my $dumpbin = 'C:\Program Files (x86)\Microsoft Visual Studio 12.0\VC\bin\dumpbin.exe';
++		my $text = `"$dumpbin" /headers "$lib"`;
++		if ($text =~/\s*([\da-fA-F]+)\s+image base/) {
++			my $image_base = $1;
++			# print STDERR "\"$dumpbin\" /headers \"$lib\"  ----- $image_base\n";
++			$offset = AddressAdd("00000000", $image_base);
++		} else {
++			print STDERR "不能用dumpbin命令解析出 $lib 的 image base address\n";
++			exit 1;
++		}
++	}
++
+     push(@{$result}, [$lib, $start, $finish, $offset]);
+   }
+ 
+@@ -4587,7 +4613,6 @@ sub ExtractSymbols {
+     my $start = $lib->[1];
+     my $finish = $lib->[2];
+     my $offset = $lib->[3];
+-
+     # Get list of pcs that belong in this library.
+     my $contained = [];
+     my ($start_pc_index, $finish_pc_index);
+@@ -4657,7 +4682,6 @@ sub MapToSymbols {
+       $sep_address = undef;   # no need for sep_address if we don't support -i
+     }
+   }
+-
+   # Make file with all PC values with intervening 'sep_address' so
+   # that we can reliably detect the end of inlined function list
+   open(ADDRESSES, ">$main::tmpfile_sym") || error("$main::tmpfile_sym: $!\n");
+@@ -4665,6 +4689,7 @@ sub MapToSymbols {
+   for (my $i = 0; $i <= $#{$pclist}; $i++) {
+     # addr2line always reads hex addresses, and does not need '0x' prefix.
+     if ($debug) { printf STDERR ("%s\n", $pclist->[$i]); }
++
+     printf ADDRESSES ("%s\n", AddressSub($pclist->[$i], $offset));
+     if (defined($sep_address)) {
+       printf ADDRESSES ("%s\n", $sep_address);
+@@ -4843,7 +4868,7 @@ sub ConfigureObjTools {
+     my $escaped_prog_file = ShellEscape($prog_file);
+     $file_type = `/usr/bin/file -L $escaped_prog_file 2>$dev_null ||
+                   /usr/bin/file $escaped_prog_file`;
+-  } elsif ($^O == "MSWin32") {
++  } elsif ($^O eq "MSWin32") {
+     $file_type = "MS Windows";
+   } else {
+     print STDERR "WARNING: Can't determine the file type of $prog_file";
+@@ -4930,7 +4955,8 @@ sub ShellEscape {
+     my $escaped_word = $word;
+     if ($word =~ m![^a-zA-Z0-9/.,_=-]!) {  # check for anything not in whitelist
+       $escaped_word =~ s/'/'\\''/;
+-      $escaped_word = "'$escaped_word'";
++	  #$escaped_word = "'$escaped_word'";
++      $escaped_word = "\"$escaped_word\"";
+     }
+     push(@escaped_words, $escaped_word);
+   }
+-
+
+--------------------------------------------------------
+
+
+7.
+heap profiler设置相关的环境变量
+
+//----------------------------------------------------------------------
+// Flags that control heap-profiling
+//
+// The thread-safety of the profiler depends on these being immutable
+// after main starts, so don't change them.
+//----------------------------------------------------------------------
+
+DEFINE_int64(heap_profile_allocation_interval,
+             EnvToInt64("HEAP_PROFILE_ALLOCATION_INTERVAL", 1 << 30 /*1GB*/),
+             "If non-zero, dump heap profiling information once every "
+             "specified number of bytes allocated by the program since "
+             "the last dump.");
+DEFINE_int64(heap_profile_deallocation_interval,
+             EnvToInt64("HEAP_PROFILE_DEALLOCATION_INTERVAL", 0),
+             "If non-zero, dump heap profiling information once every "
+             "specified number of bytes deallocated by the program "
+             "since the last dump.");
+// We could also add flags that report whenever inuse_bytes changes by
+// X or -X, but there hasn't been a need for that yet, so we haven't.
+DEFINE_int64(heap_profile_inuse_interval,
+             EnvToInt64("HEAP_PROFILE_INUSE_INTERVAL", 100 << 20 /*100MB*/),
+             "If non-zero, dump heap profiling information whenever "
+             "the high-water memory usage mark increases by the specified "
+             "number of bytes.");
+DEFINE_int64(heap_profile_time_interval,
+             EnvToInt64("HEAP_PROFILE_TIME_INTERVAL", 0),
+             "If non-zero, dump heap profiling information once every "
+             "specified number of seconds since the last dump.");
+DEFINE_bool(mmap_log,
+            EnvToBool("HEAP_PROFILE_MMAP_LOG", false),
+            "Should mmap/munmap calls be logged?");
+DEFINE_bool(mmap_profile,
+            EnvToBool("HEAP_PROFILE_MMAP", false),
+            "If heap-profiling is on, also profile mmap, mremap, and sbrk)");
+DEFINE_bool(only_mmap_profile,
+            EnvToBool("HEAP_PROFILE_ONLY_MMAP", false),
+            "If heap-profiling is on, only profile mmap, mremap, and sbrk; "
+            "do not profile malloc/new/etc");
+
+
+我用默认的选项也还可以
+
+
+
+参考
+Google Heap Profiler使用方法
+http://blog.csdn.net/jhzhou/article/details/7245992
